@@ -2,144 +2,184 @@ import pandas as pd
 import boto3
 import os
 from io import StringIO
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+import traceback
 
-# Load environment variables
+# Load env vars
 load_dotenv()
 
-# AWS S3 Credentials
+# AWS + MySQL credentials
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
 S3_BUCKET = "ratingstesting"
-S3_OBJECT_KEY = "ratings_rule.py"  # S3 file name
+S3_OBJECT_KEY = "ratings_rule.py"
 
-# MySQL Database Credentials
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
 
-# Database Connection String
+# DB engine
 connection_str = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
 engine = create_engine(connection_str)
 
-# Fetch validation functions from S3 using Boto3
+# Fetch and execute validations from S3
 def load_validation_functions():
-    """Fetch and execute validation functions from AWS S3 using Boto3."""
     s3 = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
-
     try:
         response = s3.get_object(Bucket=S3_BUCKET, Key=S3_OBJECT_KEY)
         script_content = response["Body"].read().decode("utf-8")
-
-        print("\n✅ Successfully fetched `ratings_validation.py` from S3.")
-
-        # Execute the script to load functions
         exec(script_content, globals())
-
-        # Check available validation functions
-        validation_funcs = [func for func in globals() if callable(globals()[func])]
-        print("\n🔎 Validation Functions Available (Loaded from S3):")
-        for func in validation_funcs:
-            print(f"   ✅ {func}")
-
-        return validation_funcs
-
+        print("\n✅ Validation functions loaded from S3.")
+        return True
     except Exception as e:
-        print(f"\n❌ Error fetching `ratings_validation.py` from S3: {e}")
-        return []
+        print(f"\n❌ Error loading validation functions: {e}")
+        return False
 
-# Apply all loaded validation functions
-def apply_validations(df):
-    """Automatically applies validation functions to the matching columns in the DataFrame."""
-    
-    # Standardize column names (remove spaces, lowercase)
+# Apply validation logic
+def apply_validations(df, file_name, expected_week):
+    issues = []
     df.columns = df.columns.str.strip().str.lower()
 
-    applied_funcs = []
+    try:
+        if "clean_product_id" in globals() and "product_id" in df.columns:
+            df["product_id"] = df["product_id"].astype(str).apply(globals()["clean_product_id"])
+            print("✅ Applied clean_product_id")
+    except Exception as e:
+        issues.append(f"clean_product_id failed: {e}")
 
-    if "clean_product_id" in globals() and "product_id" in df.columns:
-        df["product_id"] = df["product_id"].astype(str)
-        df["product_id"] = df["product_id"].apply(globals()["clean_product_id"])
-        applied_funcs.append("clean_product_id")
+    try:
+        if "standardize_date" in globals() and "scraped_date" in df.columns:
+            df = globals()["standardize_date"](df, "scraped_date", "scraped_week", "scraped_year")
+            print("✅ Standardized scraped_date")
+    except Exception as e:
+        issues.append(f"standardize_date failed: {e}")
 
-    if "standardize_date" in globals() and "scraped_date" in df.columns:
-        df = globals()["standardize_date"](df, col="scraped_date", col_wk="scraped_week", col_yr="scraped_year")
-        applied_funcs.append("standardize_date")
+    try:
+        if "clean_text" in globals():
+            for col in ["brand", "brand_tag", "f_category"]:
+                if col in df.columns:
+                    df[col] = df[col].apply(globals()["clean_text"])
+                    print(f"✅ Cleaned text for: {col}")
+    except Exception as e:
+        issues.append(f"clean_text failed: {e}")
 
-    if "clean_text" in globals():
-        text_columns = ["brand", "brand_tag", "f_category"]
-        for col in text_columns:
-            if col in df.columns:
-                df[col] = df[col].apply(globals()["clean_text"])
-                applied_funcs.append(f"clean_text ({col})")
+    try:
+        if "remove_duplicates" in globals():
+            before = len(df)
+            df = globals()["remove_duplicates"](df)
+            print(f"✅ Removed {before - len(df)} duplicates")
+    except Exception as e:
+        issues.append(f"remove_duplicates failed: {e}")
 
-    if "remove_duplicates" in globals():
-        before_dupes = len(df)
-        df = globals()["remove_duplicates"](df)
-        after_dupes = len(df)
-        dupes_removed = before_dupes - after_dupes
-    else:
-        dupes_removed = 0
+    try:
+        if "correct_count_overall" in globals():
+            df = globals()["correct_count_overall"](df, file_name)
+    except Exception as e:
+        issues.append(f"correct_count_overall failed: {e}")
 
-    if "correct_count_overall" in globals() and "count_overall" in df.columns:
-        df = globals()["correct_count_overall"](df)
-        applied_funcs.append("correct_count_overall")
+    try:
+        if "report_zero_ratings" in globals():
+            zeros = globals()["report_zero_ratings"](df)
+            print(f"✅ Zero rating rows: {len(zeros)}")
+    except Exception as e:
+        issues.append(f"report_zero_ratings failed: {e}")
 
-    if "report_zero_ratings" in globals():
-        zero_ratings_count = len(globals()["report_zero_ratings"](df))
-    else:
-        zero_ratings_count = 0
+    try:
+        if "validate_scraped_week" in globals():
+            globals()["validate_scraped_week"](df, expected_week)
+    except Exception as e:
+        issues.append(str(e))
 
-    # Print summary
-    print("\n🔹 **Validation Summary**")
-    print(f"   ✅ Total Rows Processed: {len(df)}")
-    print(f"   ✅ Product_id Cleaned: {df['product_id'].str.contains('/').sum()} → {df['product_id'].str.contains('/').sum()}")
-    print(f"   ✅ Duplicates Removed: {dupes_removed}")
-    print(f"   ✅ Zero Rating Rows: {zero_ratings_count}")
-    print(f"   ✅ Count Mismatch Errors Fixed: {df['count_overall'].isna().sum()}")
+    try:
+        if "validate_rating_dependency" in globals():
+            globals()["validate_rating_dependency"](df, file_name)
+    except Exception as e:
+        issues.append(str(e))
 
-    return df
+    if issues:
+        df["validation_issues"] = "\n".join(issues)
+    return df, issues
 
-# Upload validated data to AWS S3
-def upload_to_s3(data, filename):
-    """Uploads validated data to AWS S3 bucket."""
+# Upload to S3
+def upload_to_s3(data, filename, folder=""):
     s3 = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
     csv_buffer = StringIO()
     data.to_csv(csv_buffer, index=False)
-    s3.put_object(Bucket=S3_BUCKET, Key=filename, Body=csv_buffer.getvalue())
-    print(f"✅ Data uploaded to S3: {filename}")
+    key = f"{folder}{filename}"
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=csv_buffer.getvalue())
+    print(f"✅ Uploaded to S3: s3://{S3_BUCKET}/{key}")
 
-# Save validated data to MySQL
+# Save to MySQL
 def save_to_database(df, table_name="ratings_test"):
-    """Saves validated data to MySQL table."""
-    with engine.connect() as connection:
-        with connection.begin():
-            df = df.drop(columns=["brand_v2"], errors="ignore")
-            df.to_sql(table_name, con=connection, if_exists="append", index=False)
-    print(f"✅ Data inserted into MySQL table: {table_name}")
+    with engine.begin() as conn:
+        df = df.drop(columns=["brand_v2", "validation_issues"], errors="ignore")
+        df.to_sql(table_name, con=conn, if_exists="append", index=False)
+    print(f"✅ Data inserted into MySQL → {table_name}")
 
-# Main function to process the file
-def process_file(file_path):
-    print("\n🔄 Fetching validation functions from AWS S3...")
-    validation_funcs = load_validation_functions()
+# Log file name to ratings_files table
+def log_uploaded_file(file_name):
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO ratings_files (file_name) VALUES (:f)"), {"f": file_name})
+    print("✅ Logged uploaded file.")
 
-    print(f"\n🔄 Loading CSV file from local path: {file_path}...")
-    df = pd.read_csv(file_path)
+# View uploaded files from DB
+def view_uploaded_files():
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT file_name, real_time FROM ratings_files ORDER BY real_time DESC LIMIT 10"))
+        files = result.fetchall()
+        if not files:
+            print("⚠ No uploaded files found.")
+        else:
+            print("\n📁 Last 10 Uploaded Files:")
+            for f in files:
+                print(f"   • {f.file_name} → {f.real_time}")
 
-    # Print total row count before validation
-    print(f"\n✅ Total Rows in Source File: {len(df)}")
+# Main process
+def main():
+    print("\n📌 Choose Action:\n1️⃣ Upload Data\n2️⃣ View Uploaded Files")
+    choice = input("Enter choice (1 or 2): ").strip()
 
-    print("\n🔄 Running validation checks...")
-    df = apply_validations(df)
+    if choice == "2":
+        view_uploaded_files()
+        return
 
-    print("\n✅ All validation checks passed! Uploading data...")
-    filename = f"validated_data.csv"
-    upload_to_s3(df, filename)
-    save_to_database(df)
-    print("\n✅ Process completed successfully.")
+    elif choice == "1":
+        week = input("\n📆 Enter week number (e.g., 12): ").strip().replace("wk", "").zfill(2)
+        week_folder = f"wk{week}/"
 
+        file_path = input("\n📄 Enter full file path (CSV): ").strip().strip('"').strip("'")
+
+        if not os.path.isfile(file_path):
+            print("❌ File does not exist.")
+            return
+
+        if not load_validation_functions():
+            print("❌ Aborting due to validation load error.")
+            return
+
+        df = pd.read_csv(file_path)
+        print(f"\n🔍 Rows in file: {len(df)}")
+
+        file_name = os.path.basename(file_path)
+        df, issues = apply_validations(df, file_name, expected_week=week)
+
+        if issues:
+            failed_name = f"FAILED_{file_name}"
+            upload_to_s3(df, failed_name, folder=week_folder)
+            print(f"❌ Validation failed. Issues written to: {failed_name}")
+            return
+
+        upload_to_s3(df, file_name, folder=week_folder)
+        save_to_database(df)
+        log_uploaded_file(file_name)
+
+        print("\n✅ All steps completed successfully.")
+    else:
+        print("❌ Invalid option. Choose 1 or 2.")
+
+# Run main
 if __name__ == "__main__":
-    file_path = r"C:\Users\A\Downloads\nathabit_ratings_wk4_2025.csv" #change source as per user requriement 
-    process_file(file_path)
+    main()
+
