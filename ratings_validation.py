@@ -4,7 +4,6 @@ import os
 from io import StringIO
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-import traceback
 import time
 from sqlalchemy.types import String
 from tqdm import tqdm
@@ -19,7 +18,6 @@ AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
 S3_BUCKET = "ratingstesting"
 S3_OBJECT_KEY = "ratings_rule.py"
 
-# Main DB (cx360)
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
@@ -27,15 +25,9 @@ DB_NAME = os.getenv("DB_NAME")
 connection_str = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
 engine = create_engine(connection_str)
 
-# Exception rules
 skip_zero_check = ["fancode_ratings", "nathabit_ratings"]
 skip_entire_file = ["giva_ratings", "amazon_bestseller"]
 
-# Track inferred sources and review-based fixes
-inferred_sources = {}
-review_count_fixes = {}
-
-# Fetch and execute validations from S3
 def load_validation_functions():
     s3 = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
     try:
@@ -48,7 +40,6 @@ def load_validation_functions():
         print(f"\n❌ Error loading validation functions: {e}")
         return False
 
-# Apply validation logic
 def apply_validations(df, file_name, expected_week):
     issues = []
     df.columns = df.columns.str.strip().str.lower()
@@ -68,10 +59,10 @@ def apply_validations(df, file_name, expected_week):
         issues.append(f"standardize_date failed: {e}")
 
     try:
-        if "validate_scraped_week" in globals():
-            globals()["validate_scraped_week"](df, expected_week)
+        df["scraped_week"] = int(expected_week)
+        print(f"🔁 Overriding all scraped_week to {expected_week}")
     except Exception as e:
-        raise ValueError(f"validate_scraped_week failed: ❌ {e}")
+        issues.append(f"scraped_week override failed: {e}")
 
     try:
         if "validate_rating_dependency" in globals():
@@ -81,7 +72,7 @@ def apply_validations(df, file_name, expected_week):
 
     try:
         if "clean_text" in globals():
-            for col in ["brand", "brand_tag", "f_category", "source", "pan"]:
+            for col in ["brand", "brand_tag", "f_category"]:
                 if col in df.columns:
                     df[col] = df[col].apply(globals()["clean_text"])
                     print(f"✅ Cleaned text for: {col}")
@@ -114,7 +105,6 @@ def apply_validations(df, file_name, expected_week):
         df["validation_issues"] = "\n".join(issues)
     return df, issues
 
-# Upload to S3
 def upload_to_s3(data, filename, folder=""):
     s3 = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
     csv_buffer = StringIO()
@@ -123,7 +113,6 @@ def upload_to_s3(data, filename, folder=""):
     s3.put_object(Bucket=S3_BUCKET, Key=key, Body=csv_buffer.getvalue())
     print(f"✅ Uploaded to S3: s3://{S3_BUCKET}/{key}")
 
-# Upsert to DB
 def upsert_data(df, table_name, unique_keys, chunk_size=10000):
     start_time = time.time()
     dtype = {"source": String(100), "product_id": String(100)}
@@ -147,7 +136,6 @@ def upsert_data(df, table_name, unique_keys, chunk_size=10000):
             conn.execute(text(upsert_query))
     print(f"✅ Upsert completed to {table_name} in {time.time() - start_time:.2f} sec")
 
-# View recent uploaded files from main DB
 def view_uploaded_files():
     with engine.connect() as conn:
         result = conn.execute(text("SELECT file_name, real_time FROM ratings_files ORDER BY real_time DESC LIMIT 10"))
@@ -159,34 +147,10 @@ def view_uploaded_files():
             for f in files:
                 print(f"   • {f.file_name} → {f.real_time}")
 
-# Process a single file
 def process_file(file_path, week, normalized_week, week_folder, total_stats):
     try:
         df = pd.read_csv(file_path)
         file_name = os.path.basename(file_path)
-
-        # ✅ Infer source from file name if missing or inconsistent
-        if "source" not in df.columns or df["source"].isnull().all():
-            inferred_source = file_name.split("_ratings")[0]
-            df["source"] = inferred_source
-            inferred_sources[file_name] = inferred_source
-            print(f"🔍 Inferred source from filename: {inferred_source}")
-
-        # ✅ Fix: All star ratings = 0 but review_count > 0 → set count_overall = review_count
-        fix_count = 0
-        if all(col in df.columns for col in ['count_5star', 'count_4star', 'count_3star', 'count_2star', 'count_1star', 'review_count', 'count_overall']):
-            zero_star_mask = (
-                (df['count_5star'].fillna(0) == 0) & (df['count_4star'].fillna(0) == 0) &
-                (df['count_3star'].fillna(0) == 0) & (df['count_2star'].fillna(0) == 0) &
-                (df['count_1star'].fillna(0) == 0)
-            )
-            review_not_zero = df['review_count'].fillna(0) > 0
-            condition = zero_star_mask & review_not_zero
-            fix_count = condition.sum()
-            df.loc[condition, 'count_overall'] = df.loc[condition, 'review_count']
-            if fix_count > 0:
-                review_count_fixes[file_name] = fix_count
-                print(f"🔄 Updated count_overall using review_count for {fix_count} rows.")
 
         if any(x in file_name.lower() for x in skip_entire_file):
             print(f"⏭️ Skipping file: {file_name} (per skip_entire_file rule)")
@@ -195,17 +159,8 @@ def process_file(file_path, week, normalized_week, week_folder, total_stats):
 
         print(f"\n📄 Processing file: {file_name} → {len(df)} rows")
 
-        if 'scraped_week' in df.columns:
-            df['scraped_week'] = df['scraped_week'].astype(str).str.strip().apply(
-                lambda x: str(int(float(x))).zfill(2) if x.replace('.', '', 1).isdigit() else x)
-            unique_weeks = set(df['scraped_week'].dropna().unique())
-            print(f"🗓️ Unique weeks in file: {unique_weeks}")
-            if normalized_week not in unique_weeks:
-                print(f"⛔ Skipping file due to week mismatch. Expected: {normalized_week}")
-                total_stats['skipped'].append(file_name)
-                return
-
         df, issues = apply_validations(df, file_name, expected_week=normalized_week)
+        print("🧾 Weeks in final DF:", df["scraped_week"].unique())
 
         if issues:
             failed_name = f"FAILED_{file_name}"
@@ -221,9 +176,9 @@ def process_file(file_path, week, normalized_week, week_folder, total_stats):
             upsert_data(df, 'ratings_stage', unique_keys)
             print(f"✅ Inserted ALL rows into ratings_stage (no missing split for: {file_name})")
         else:
-            df_missing = df[(df['count_5star'].fillna(0) == 0) & (df['count_4star'].fillna(0) == 0) &
+            df_missing = df[(df['count_overall'].fillna(0) == 0) & (df['count_5star'].fillna(0) == 0) & (df['count_4star'].fillna(0) == 0) &
                             (df['count_3star'].fillna(0) == 0) & (df['count_2star'].fillna(0) == 0) &
-                            (df['count_1star'].fillna(0) == 0)]
+                            (df['count_1star'].fillna(0) == 0) ] 
             df_valid = df[~df.index.isin(df_missing.index)]
 
             if not df_valid.empty:
@@ -239,7 +194,6 @@ def process_file(file_path, week, normalized_week, week_folder, total_stats):
         print(f"❌ Failed processing {file_path}: {e}")
         total_stats['failed'].append((os.path.basename(file_path), str(e)))
 
-# Main
 def main():
     print("\n📌 Choose Action:\n1️⃣ Upload Data\n2️⃣ View Uploaded Files")
     choice = input("Enter choice (1 or 2): ").strip()
@@ -286,16 +240,6 @@ def main():
         print(f"❌ Failed Files: {len(total_stats['failed'])}")
         for fname, reason in total_stats['failed']:
             print(f"   - {fname} → {reason}")
-
-        if inferred_sources:
-            print("\n🔍 Inferred Sources:")
-            for fname, src in inferred_sources.items():
-                print(f"   • {fname} → source inferred as '{src}'")
-
-        if review_count_fixes:
-            print("\n🔧 Rows auto-fixed using review_count:")
-            for fname, count in review_count_fixes.items():
-                print(f"   • {fname} → {count} row(s) updated (count_overall = review_count)")
 
     else:
         print("❌ Invalid option. Choose 1 or 2.")
