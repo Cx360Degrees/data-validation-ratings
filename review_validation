@@ -1,0 +1,127 @@
+import boto3
+import pandas as pd
+import numpy as np
+import re
+import os
+import urllib.parse
+import sqlalchemy
+import tempfile
+import importlib.util
+from io import StringIO
+from dotenv import load_dotenv
+
+# --- Load environment variables ---
+load_dotenv(".env.reviews_config")
+
+# --- AWS & DB Setup from env ---
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_PORT = int(os.getenv("DB_PORT"))
+TABLE_NAME = os.getenv("TABLE_NAME")
+
+engine = sqlalchemy.create_engine(
+    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
+
+# --- Load validation module from S3 ---
+s3 = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
+response = s3.get_object(Bucket='ratingstesting', Key='review_rules.py')
+with tempfile.NamedTemporaryFile(delete=False, suffix="_review_rules.py") as temp_file:
+    temp_file.write(response['Body'].read())
+    temp_path = temp_file.name
+
+spec = importlib.util.spec_from_file_location("review_rules", temp_path)
+review_rules = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(review_rules)
+
+etl_reviews = review_rules.etl_reviews
+stnd_cols_reviews = review_rules.stnd_cols_reviews
+
+# --- Filename Pattern ---
+week_pattern = re.compile(r"_wk\d+_2025\.csv$")
+
+# --- Prompt for user input ---
+target_week = int(input("\U0001F4E5 Enter the week number you want to process data for (e.g., 14): "))
+user_input_path = input("\U0001F4C2 Enter the file or folder path to be processed (e.g., amazon/ or C:/path/to/file.csv): ").strip().strip('"')
+
+# Detect if it's a folder or file
+is_folder = user_input_path.endswith('/')
+source_paths = []
+
+if os.path.isfile(user_input_path):
+    source_paths = [user_input_path]  # local file
+elif is_folder:
+    paginator = s3.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=BUCKET_NAME, Prefix=user_input_path)
+    for page in pages:
+        for obj in page.get('Contents', []):
+            if week_pattern.search(obj['Key']):
+                source_paths.append(obj['Key'])
+else:
+    source_paths = [user_input_path]  # assume S3 key
+
+# --- Main Execution ---
+summary_data = []
+
+for key in source_paths:
+    filename = os.path.basename(key)
+    source = os.path.basename(os.path.dirname(key)) if os.path.isfile(key) else key.split('/')[0]
+
+    if os.path.isfile(key):
+        df_raw = pd.read_csv(key)
+    else:
+        response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
+        df_raw = pd.read_csv(response['Body'])
+
+    total_rows = len(df_raw)
+
+    try:
+        df_cleaned, changed_count, invalid_week_count = etl_reviews(df_raw, source, target_week)
+        inserted_rows = len(df_cleaned)
+        dropped_rows = total_rows - inserted_rows
+
+        cleaned_csv = df_cleaned.to_csv(index=False)
+        upload_key = f"wk{target_week}/{filename}"
+        s3.put_object(Bucket=BUCKET_NAME, Key=upload_key, Body=cleaned_csv.encode('utf-8'))
+
+        df_cleaned.to_sql(TABLE_NAME, con=engine, if_exists='append', index=False)
+
+        reason = "✅ Cleaned, validated, uploaded & inserted"
+
+    except Exception as e:
+        inserted_rows = 0
+        dropped_rows = total_rows
+        changed_count = 0
+        invalid_week_count = 0
+        reason = f"❌ Error: {str(e)}"
+
+    print(f"✅ Processed: {filename}")
+    print(f"   Total Rows: {total_rows}")
+    print(f"   Inserted  : {inserted_rows}")
+    print(f"   Dropped   : {dropped_rows}")
+    print(f"   Scraped Week corrected for: {changed_count} rows")
+    print(f"   Invalid review_week > scraped_week Rows: {invalid_week_count}")
+    print(f"   Status    : {reason}")
+    print("-" * 60)
+
+    summary_data.append({
+        'file': filename,
+        'folder': source,
+        'total_rows': total_rows,
+        'inserted_rows': inserted_rows,
+        'dropped_rows': dropped_rows,
+        'scraped_week_forced_rows': changed_count,
+        'invalid_review_week_rows': invalid_week_count,
+        'reason': reason
+    })
+
+summary_df = pd.DataFrame(summary_data)
+summary_file = f"etl_summary_forced_week{target_week}.csv"
+summary_df.to_csv(summary_file, index=False)
+print(f"\U0001F4C4 ETL Complete. Summary saved to {summary_file}")
